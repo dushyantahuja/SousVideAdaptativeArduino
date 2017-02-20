@@ -1,19 +1,13 @@
 /*
 *
-*  SousVideWith8SegmentDisplays
-*
-*  Adaptative regulation sous-vide cooker algorithm
-*
-*  See http://www.instructables.com/id/Cheap-and-effective-Sous-Vide-cooker-Arduino-power/ for more info
-*
-*  Author : Etienne Giust - 2013, 2014
+*  Original Author : Etienne Giust - 2013, 2014
+*  Modified to include ESP8266 and MQTT Support by: Dushyant Ahuja - 2017
 *
 *  Features
 *
 *  - Works out of the box : no need for tweaking or tuning, the software adapts itself to the characteristics of your cooker :  whether it is big, small, full of water, half-full, whether room temperature is low or high, it works.
 *  - Efficient regulation in the range of 0.5°C
-*  - Sound alarm warns when target temperature is reached
-*  - Automatic detection of lid opening and closing : regulation does not get mad when temperature probe is taken out of the water (which is a thing you need to do if you want to actually put food in your cooker)
+*  - MQTT Based (OpenHAB integration possible / recommended)
 *  - Safety features : 
 *     - automatic cut-off after 5 minutes of continuous heating providing no change in temperature
 *     - automatic cut-off after 24 hours of operation
@@ -44,59 +38,41 @@
 
 // ------------------------- PARTS NEEDED
 
-// Arduino board
-// integrated 8 digits led display with MAX7219 control module (3 wire interface) 
-// Pushbutton x 2
-// Piezo element 
+// Sonoff IOT Relay
 // Waterproof DS18B20 Digital temperature sensor
 // 4.7K ohm resistor 
-// 5V Relay module for Arduino, capable to drive AC125/250V at 10A
-// Rice Cooker
+// Rice Cooker / Crockpot
 
 // ------------------------- PIN LAYOUT
 //
 // inputs
-// Pushbutton + on pin 6 with INPUT_PULLUP mode
-// Pushbutton - on pin 5 with INPUT_PULLUP mode
-// Temperature sensor on pin 9 (data pin of OneWire sensor)
+// Temperature sensor on pin 14 (data pin of OneWire sensor) (Fifth pin on the Sonoff Header)
 
 // outputs
-// Relay on pin 8
-// Speaker (piezo) on pin 13
-// 8 digit LED display  DataIn on pin 12 
-// 8 digit LED display  CLK on pin 11 
-// 8 digit LED display  LOAD on pin 10 
+// Relay on pin 12
+// Sonoff LED on Pin 13 (Low to turn on)
 
 
 // ------------------------- LIBRARIES
-#include <LedControl.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 
 // ------------------------- CONSTANTS
 
-// 8 segment display drivers
-#define TEMP_DISPLAY_DRIVER 0
-#define DISPLAY_LEFT 4  //left 4 digits of display
-#define DISPLAY_RIGHT 0  //right 4 digits of display
-#define REVERSE_DISPLAY 0 //set to 7 if your displays first digit is on the left
-
-// push-buttons
-#define BT_TEMP_MORE_PIN 6 //INPUT_PULLUP mode
-#define BT_TEMP_LESS_PIN 5 //INPUT_PULLUP mode
-
-// piezo
-#define PIEZO_PIN 13
-
 // temperature sensor
-#define ONE_WIRE_BUS 9
+#define ONE_WIRE_BUS 14
 #define TEMPERATURE_PRECISION 9
 #define SAMPLE_DELAY 5000
 #define OUTPUT_TO_SERIAL true
 
 // relay
-#define RELAY_OUT_PIN 8
+#define RELAY_OUT_PIN 12
 
 
 // First Ramp
@@ -114,11 +90,17 @@
 #define DROP_DEGREES_FOR_CALC_REGULATION 0.12 /* minimum drop in degrees used to calculate regulation timings (should be small : <0.2 ) */
 #define LARGE_TEMP_DIFFERENCE 1  /* for more than "1" degree, use the Large setting (Small otherwise)*/
 
-// ------------------------- DEFINITIONS & INITIALISATIONS
+// ESP8266 missing functions (min / max)
+#define min(a,b) ((a)<=(b)?(a):(b))
+#define max(a,b) ((a)>=(b)?(a):(b))
 
-// buttons
-int sw_tempMore;
-int sw_tempLess;
+// ESP8266 Definitions - Make sure to change the following for your network
+
+const char* ssid = "***********";
+const char* password = "*************";
+IPAddress server(192, 168, 1, 236);
+
+// ------------------------- DEFINITIONS & INITIALISATIONS
 
 // temperatures
 double environmentTemp = 0;
@@ -179,24 +161,19 @@ unsigned long tCheckStabilize  = 0;
 unsigned long tCheckTakeOff = 0;
 unsigned long tBackToLow = 0;
 unsigned long tBackToHigh = 0;
-unsigned long delaytime=100;
+unsigned long delaytime=1000;
 
 // security variables
 unsigned long  maxUptimeMillis;
 unsigned long  tCheckNotHeatingWildly;
 
+// ESP8266 variables
+WiFiClient espClient;
+PubSubClient client(espClient, server);
+long lastMsg = 0;
+char msg[50];
+int value = 0;
 
-
-// 7-segment and sensor variables
-
-/*
- LedControl :
- pin 12 is connected to the DataIn 
- pin 11 is connected to the CLK 
- pin 10 is connected to LOAD 
- We have 1 MAX7219.
-*/
-LedControl lc=LedControl(12,11,10,1);
 // Set up a oneWire instance and Dallas temperature sensor
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);	
@@ -209,21 +186,7 @@ DeviceAddress tempProbeAddress;
 void setup() {
 
 	Serial.begin(9600); 
-	/*
-	Initialize MAX7219 display driver
-	*/
-	  lc.shutdown(0,false);
-	  lc.setIntensity(0,2);
-	  lc.clearDisplay(0);
-
-	/*
-	Initialize pushButtons
-	*/
-	pinMode(BT_TEMP_MORE_PIN, INPUT_PULLUP);
-	pinMode(BT_TEMP_LESS_PIN, INPUT_PULLUP);
-	/*
-	Initialize temperature sensor
-	*/
+  //	Initialize temperature sensor
 	sensors.begin();
 	delay(1000);   
 	sensors.getAddress(tempProbeAddress, 0);  
@@ -253,9 +216,96 @@ void setup() {
 	warningsBeforeCounterFall = 3;
 	opState = INITIAL_WAIT;
 
+	//ESP8266 Initialize
+  ArduinoOTA.setHostname("sousvide");
+	setup_wifi();
+  
+  client.set_callback(callback);
+  
 	delay(3000);
+
+  
 }
 
+/**************************************************************************************/
+/*                                                                                    */
+/*                                      ESP8266                                       */
+/*                                                                                    */
+/**************************************************************************************/
+
+
+void setup_wifi() {
+
+  //delay(10);
+  // We start by connecting to a WiFi network
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.println("Connection Failed! Rebooting...");
+    delay(5000);
+    ESP.restart();
+  }
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+}
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    if (client.connect("sonoff03")) {
+      // Once connected, publish an announcement...
+      client.publish("sonoff03/stat", "Sonoff03 Alive - Sous Vide Mode");
+      // ... and resubscribe
+      client.subscribe("sonoff03/settemp");
+      client.subscribe("sonoff03/12");
+    } else {
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void callback(const MQTT::Publish& pub) {
+ boolean bset = false;
+ Serial.print(pub.topic());
+ Serial.print(" => ");
+ Serial.println(pub.payload_string());
+ String payload = pub.payload_string();
+ if(String(pub.topic()) == "sonoff03/12"){
+    if (payload == "1") {
+      digitalWrite(12, HIGH);  
+      client.publish("sonoff03/12/stat", "1"); // manual on
+    } else {
+      digitalWrite(12, LOW);  
+      client.publish("sonoff03/12/stat", "0");
+      targetTemp = 1;                          // Set targetTemp to 1 (to shutdown relay)
+    }
+ }
+ if(String(pub.topic()) == "sonoff03/settemp"){
+    if(payload.toInt() == 0)
+      client.publish("sonoff03/stat", "Invalid Set Temperature");
+     else{
+      targetTemp = payload.toInt();
+      if (targetTemp > actualTemp)    isWaitingForTempAlert = true;
+     }
+ }
+}
 
 
 /**************************************************************************************/
@@ -266,6 +316,13 @@ void setup() {
 
 
 void loop() {   
+
+  // ESP8266 Functions
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  ArduinoOTA.handle();
       
   tcurrent = millis();
   
@@ -1199,7 +1256,7 @@ void checkShutdownConditions(){
 
 void shutdownDevice() 
 {
-    eraseDisplay();
+  client.publish("sonoff/03","Shutting Down");
 	displayActualTemp(0);
 	displayTargetTemp(0);
 
@@ -1217,17 +1274,7 @@ void shutdownDevice()
 
 void readButtonInputs()
 { 
-  // read buttons
-  sw_tempMore = digitalRead(BT_TEMP_MORE_PIN);
-  sw_tempLess = digitalRead(BT_TEMP_LESS_PIN);
 
-  
-  // process inputs
-  if (sw_tempMore == LOW) { 
-    targetTemp= min(targetTemp + 0.5, MAX_TARGET_TEMP);    
-    if (targetTemp > actualTemp)    isWaitingForTempAlert = true;
-  }
-  if (sw_tempLess == LOW) targetTemp-=0.5; 
 }
 
 
@@ -1358,117 +1405,19 @@ bool IsAcceleratingFall()
 }
 
 
-// ------------------------- 7-SEGMENT UTILITIES
-
-void printNumber(int wholePart, int decimalPart, boolean showDecimal, int displayAddress, int displaySide, boolean forceLowerRight) {
-    int ones;
-    int tens;
-    int hundreds;
-    int tenths;
-    int n = wholePart;  
-    // Erase and exit if wholePart does not fit
-    if (wholePart > 999) {
-        eraseDisplay(displayAddress, displaySide);
-        return;
-    }  
-      
-    // Manage ShowDecimal Case 
-    if (showDecimal && decimalPart < 10){
-      tenths = decimalPart;        
-    } else {
-      showDecimal = false;
-    }
-      
-    // Compute individual digits
-    ones= (int) (n%10);
-    n=n/10;
-    tens= (int) (n%10);
-    n=n/10;
-    hundreds= (int) n;			
-    
-    
-    // Print the number digit by digit (do not print leading zeroes)
-    if (showDecimal)
-    {
-      // ex : 153.2
-      if (wholePart > 99)     {
-        lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+3)),(byte)hundreds,false);
-      } else {
-        eraseDigit(displayAddress,displaySide,3);
-      }
-      if (wholePart > 9)      
-      { 
-        lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+2)),(byte)tens,false);
-      }else {
-        eraseDigit(displayAddress,displaySide,2);
-      }      
-      lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+1)),(byte)ones,true);
-      lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-displaySide),(byte)tenths,forceLowerRight);
-    } 
-    else
-    { 
-      // ex :  946
-      lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+3)),' ',false);
-      if (wholePart > 99)     {
-        lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+2)),(byte)hundreds,false);
-      } else {   
-        eraseDigit(displayAddress,displaySide,2);
-      }
-      if (wholePart > 9)      {
-        lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+1)),(byte)tens,false);
-      } else {
-        eraseDigit(displayAddress,displaySide,1);
-      }
-      lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-displaySide),(byte)ones,forceLowerRight);
-    }
-}
-
-void eraseDigit(int displayAddress, int displaySide, int digitIndex) {
-    lc.setChar(displayAddress,abs(REVERSE_DISPLAY-(displaySide+digitIndex)),' ',false);
-}
-
-void eraseDisplay(int displayAddress, int displaySide) {       
-    // Erase the 4-digit
-    eraseDigit(displayAddress,displaySide,0);
-    eraseDigit(displayAddress,displaySide,1);
-    eraseDigit(displayAddress,displaySide,2);
-    eraseDigit(displayAddress,displaySide,3);
-}
-
-void eraseDisplay(int displayAddress) {       
-    // Erase the 2 sides of display
-    eraseDisplay(displayAddress, DISPLAY_LEFT);
-    eraseDisplay(displayAddress, DISPLAY_RIGHT);
-}
-
-void eraseDisplay() {       
-    // Erase all displays
-    for(int index=0;index<lc.getDeviceCount();index++) {
-      eraseDisplay(index);
-    }
-}
-
-void displayTemp(float temp, int side)
-{ 
-  boolean showDecimal = true;
-    
-  int decimalPart = (int) (((int)(temp * 100)) % 100); 
-  int tenths = decimalPart / 10;
-  
-  int hundredths =  decimalPart % 10;
-  if (hundredths > 5) 
-  tenths = tenths + 1 ; // round to closest digit
-  
-  printNumber((int) temp, tenths, showDecimal, TEMP_DISPLAY_DRIVER, side, false);
-}
+// ------------------------- MQTT UTILITIES 
 
 void displayActualTemp(float temp)
 {
-  displayTemp(temp, DISPLAY_LEFT);
+  char output[10];
+  dtostrf(temp, 5,2,output);
+  client.publish("sonoff03/stat/actual",output);
 }
 void displayTargetTemp(float temp)
 {
-  displayTemp(temp, DISPLAY_RIGHT);
+  char output[10];
+  dtostrf(temp, 5,2,output);
+  client.publish("sonoff03/stat/target",output);
 }
 
 
@@ -1476,20 +1425,15 @@ void displayTargetTemp(float temp)
 
 void soundAlarm()
 {
-  //Serial.println("ALERT");
-  for(int index=0;index<3;index++) {
-    tone(PIEZO_PIN, 650, 1000);
-    //Serial.println("BIIP");
-    delay(2000);
-  }  
+  client.publish("sonoff03/alarm","Alarm");
 }
 
 void alertTemperatureNearlySet()
 {
   if (isWaitingForTempAlert == true && abs(targetTemp - actualTemp) < 0.3)
-  {
-    soundAlarm();
-    isWaitingForTempAlert = false;
+   {
+     client.publish("sonoff03/stat","Target Temperature Nearly Set");
+     isWaitingForTempAlert = false;
   }  
 }
 
