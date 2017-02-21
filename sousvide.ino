@@ -96,8 +96,8 @@
 
 // ESP8266 Definitions - Make sure to change the following for your network
 
-const char* ssid = "***********";
-const char* password = "*************";
+const char* ssid = "DUSHYANT";
+const char* password = "ahuja987";
 IPAddress server(192, 168, 1, 236);
 
 // ------------------------- DEFINITIONS & INITIALISATIONS
@@ -362,16 +362,19 @@ void loop() {
 				waitForSuddenRise = true;
 				
 				Serial.println("TEMP_DROP : wait temprise");
+        client.publish("sonoff03/stat","TEMP_DROP : wait temprise");
 			} else {
 				// something very cold was inserted in the cooker; or not. either way, the temp probe is back. let's regulate 							
 				if (doBackToFirstRampWhenStabilizing)
 				{
 					Serial.println("TEMP_RISE : initial ramping");
+          client.publish("sonoff03/stat","TEMP_RISE : initial ramping");
 					opState = FIRST_RAMP;
 				} 
 				else 
 				{				
-					Serial.println(" TEMP_DROP : Cold ! reg");
+					Serial.println("TEMP_DROP : Cold ! reg");
+          client.publish("sonoff03/stat","TEMP_DROP : Cold ! reg");
 					EnterRegulateStateOrWaitSmoothLowering();
 				}
 			}
@@ -386,11 +389,13 @@ void loop() {
 			if (doBackToFirstRampWhenStabilizing)
 			{
 				Serial.println(" TEMP_RISE : back to initial ramping");
+       client.publish("sonoff03/stat","TEMP_RISE : back to initial ramping");
 				opState = FIRST_RAMP;
 			} 
 			else 
 			{	
 				Serial.println(" TEMP_RISE : back to normal : reg");
+        client.publish("sonoff03/stat","TEMP_RISE : back to normal : reg");
 				EnterRegulateStateOrWaitSmoothLowering();
 			}
 		}
@@ -469,7 +474,8 @@ void loop() {
 			{
 				if(IsStabilizingOrGrowing())
 				{ 
-					Serial.println("NATURAL_DROP ended: wait stabilize");					
+					Serial.println("NATURAL_DROP ended: wait stabilize");
+         client.publish("sonoff03/stat","NATURAL_DROP ended: wait stabilize");					
 					opState = TEMP_RISE; // make sure we stabilize before regulating again
 				} 
 				
@@ -1205,6 +1211,7 @@ void turnOnRelay()
   Serial.println(tCheckNotHeatingWildly, DEC);
   tempBeforeHeating = actualTemp;
   isHeatOn = true;
+  client.publish("sonoff03/stat", "Relay ON");
 }
     
 void turnOffRelay()
@@ -1213,6 +1220,7 @@ void turnOffRelay()
   tLastTurnOffRelay = millis();
   tCheckNotHeatingWildly = 0;
   isHeatOn = false;
+  client.publish("sonoff03/stat", "Relay OFF");
 }    
     
 // Security checks    
@@ -1256,7 +1264,7 @@ void checkShutdownConditions(){
 
 void shutdownDevice() 
 {
-  client.publish("sonoff/03","Shutting Down");
+  client.publish("sonoff03/stat","Shutting Down");
 	displayActualTemp(0);
 	displayTargetTemp(0);
 
@@ -1411,13 +1419,13 @@ void displayActualTemp(float temp)
 {
   char output[10];
   dtostrf(temp, 5,2,output);
-  client.publish("sonoff03/stat/actual",output);
+  client.publish("sonoff03/actual",output);
 }
 void displayTargetTemp(float temp)
 {
   char output[10];
   dtostrf(temp, 5,2,output);
-  client.publish("sonoff03/stat/target",output);
+  client.publish("sonoff03/target",output);
 }
 
 
@@ -1425,7 +1433,7 @@ void displayTargetTemp(float temp)
 
 void soundAlarm()
 {
-  client.publish("sonoff03/alarm","Alarm");
+  client.publish("sonoff03/stat","Alarm");
 }
 
 void alertTemperatureNearlySet()
